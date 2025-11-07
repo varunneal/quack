@@ -60,7 +60,6 @@ class LinearFunc(torch.autograd.Function):
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
-    @custom_fwd(device_type="cuda")
     def forward(cls, ctx, x, weight, bias=None, fuse_grad_accum=False):
         """
         x: (..., in_features)
@@ -81,7 +80,6 @@ class LinearFunc(torch.autograd.Function):
         return out.reshape(*batch_shape, out.shape[-1])
 
     @classmethod
-    @custom_bwd(device_type="cuda")
     def backward(cls, ctx, dout, *args):
         """
         dout: (..., out_features)
@@ -121,7 +119,6 @@ class LinearActFunc(LinearFunc):
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
-    @custom_fwd(device_type="cuda")
     def forward(
         cls, ctx, x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False
     ):
@@ -170,7 +167,6 @@ class DActLinearFunc(LinearFunc):
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
-    @custom_fwd(device_type="cuda")
     def forward(cls, ctx, preact, weight, x, activation, fuse_grad_accum=False):
         """
         x: (..., in_features)
@@ -193,7 +189,6 @@ class DActLinearFunc(LinearFunc):
         return out.reshape(*batch_shape, out.shape[-1])
 
     @classmethod
-    @custom_bwd(device_type="cuda")
     def backward(cls, ctx, dout):
         """
         dout: (..., out_features)
