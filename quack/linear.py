@@ -10,6 +10,30 @@ from torch.amp import custom_fwd, custom_bwd
 
 from quack.gemm_interface import gemm, gemm_add_inplace, gemm_act, gemm_dact
 
+# --- Helpers: make torch.amp custom_fwd/custom_bwd work with @classmethod ---
+# AMP expects arg0 to be the autograd context (ctx). Our Functions use
+# @classmethod so arg0 is `cls`. These shims present ctx as arg0 to AMP while
+# still calling the original classmethod body with (cls, ctx, ...).
+def cm_custom_fwd(*dargs, **dkwargs):
+    amp_dec = custom_fwd(*dargs, **dkwargs)
+    def deco(f):
+        def wrapped(cls, ctx, *args, **kwargs):
+            def f_ctx(ctx_, *a, **k):
+                return f(cls, ctx_, *a, **k)
+            return amp_dec(f_ctx)(ctx, *args, **kwargs)
+        return wrapped
+    return deco
+
+def cm_custom_bwd(*dargs, **dkwargs):
+    amp_dec = custom_bwd(*dargs, **dkwargs)
+    def deco(f):
+        def wrapped(cls, ctx, *args, **kwargs):
+            def f_ctx(ctx_, *a, **k):
+                return f(cls, ctx_, *a, **k)
+            return amp_dec(f_ctx)(ctx, *args, **kwargs)
+        return wrapped
+    return deco
+
 
 def linear_fwd_convert_type(*tensors):
     autocast_dtype = torch.get_autocast_dtype("cuda")
@@ -60,6 +84,7 @@ class LinearFunc(torch.autograd.Function):
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
+    @cm_custom_fwd(device_type="cuda")
     def forward(cls, ctx, x, weight, bias=None, fuse_grad_accum=False):
         """
         x: (..., in_features)
@@ -69,6 +94,10 @@ class LinearFunc(torch.autograd.Function):
         """
         ctx.weight_dtype = weight.dtype
         ctx.fuse_grad_accum = fuse_grad_accum
+        # Track layout so backward can return the right number/order of grads.
+        ctx._n_inputs = 4                  # x, weight, bias, fuse_grad_accum
+        ctx._has_activation = False
+        ctx.bias_index = 2                 # position of 'bias' among inputs
         weight_og = weight
         x, weight = linear_fwd_convert_type(x, weight)
         batch_shape = x.shape[:-1]
@@ -80,6 +109,7 @@ class LinearFunc(torch.autograd.Function):
         return out.reshape(*batch_shape, out.shape[-1])
 
     @classmethod
+    @cm_custom_bwd(device_type="cuda")
     def backward(cls, ctx, dout, *args):
         """
         dout: (..., out_features)
@@ -87,9 +117,11 @@ class LinearFunc(torch.autograd.Function):
         x, weight, weight_og = ctx.saved_tensors  # weight_og is None if not ctx.fuse_grad_accum
         batch_shape = dout.shape[:-1]
         dout = dout.reshape(-1, dout.shape[-1])
+        # bias may not be the 3rd input for subclasses (e.g., LinearActFunc).
+        bias_idx = getattr(ctx, "bias_index", 2)
         dbias = (
             dout.sum(0, dtype=ctx.bias_dtype)
-            if ctx.bias_dtype is not None and ctx.needs_input_grad[2]
+            if ctx.bias_dtype is not None and ctx.needs_input_grad[bias_idx]
             else None
         )
         dx = linear_bwd_compute_input_grad(ctx, dout, weight, cls.matmul_bwd_dx)
@@ -97,8 +129,15 @@ class LinearFunc(torch.autograd.Function):
         dweight = linear_bwd_compute_weight_grad(
             ctx, dout, x, weight_og, cls.matmul_bwd_dw, cls.matmul_bwd_dw_inplace
         )
-        # return extra Nones for other classes that inherit from LinearFunc
-        return dx, dweight, dbias, *([None] * 10)
+        # Return grads in the correct order/length for the inputs that were passed.
+        if getattr(ctx, "_has_activation", False):
+            # Inputs: x, weight, activation, bias, store_preact, fuse_grad_accum
+            grads = (dx, dweight, None, dbias, None, None)
+        else:
+            # Inputs: x, weight, bias, fuse_grad_accum
+            grads = (dx, dweight, dbias, None)
+        n = getattr(ctx, "_n_inputs", len(grads))
+        return grads[:n]
 
 
 class LinearUntunedFunc(LinearFunc):
@@ -119,6 +158,7 @@ class LinearActFunc(LinearFunc):
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
+    @cm_custom_fwd(device_type="cuda")
     def forward(
         cls, ctx, x, weight, activation, bias=None, store_preact=True, fuse_grad_accum=False
     ):
@@ -131,6 +171,9 @@ class LinearActFunc(LinearFunc):
         """
         ctx.weight_dtype = weight.dtype
         ctx.fuse_grad_accum = fuse_grad_accum
+        ctx._n_inputs = 6                  # x, weight, activation, bias, store_preact, fuse_grad_accum
+        ctx._has_activation = True
+        ctx.bias_index = 3                 # bias comes after activation
         weight_og = weight
         x, weight = linear_fwd_convert_type(x, weight)
         batch_shape = x.shape[:-1]
@@ -167,6 +210,7 @@ class DActLinearFunc(LinearFunc):
 
     # Use classmethod instead of staticmethod to allow inheritance
     @classmethod
+    @cm_custom_fwd(device_type="cuda")
     def forward(cls, ctx, preact, weight, x, activation, fuse_grad_accum=False):
         """
         x: (..., in_features)
@@ -176,6 +220,7 @@ class DActLinearFunc(LinearFunc):
         """
         ctx.weight_dtype = weight.dtype
         ctx.fuse_grad_accum = fuse_grad_accum
+        ctx._n_inputs = 5  # preact, weight, x, activation, fuse_grad_accum
         weight_og = weight
         x, weight = linear_fwd_convert_type(x, weight)
         batch_shape = x.shape[:-1]
@@ -189,6 +234,7 @@ class DActLinearFunc(LinearFunc):
         return out.reshape(*batch_shape, out.shape[-1])
 
     @classmethod
+    @cm_custom_bwd(device_type="cuda")
     def backward(cls, ctx, dout):
         """
         dout: (..., out_features)
